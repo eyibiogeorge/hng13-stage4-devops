@@ -4,7 +4,9 @@
 
 set -e
 
+# -----------------------------
 # Configurable variables
+# -----------------------------
 VPC_BRIDGE="br0"
 PUBLIC_NS="ns-public"
 PRIVATE_NS="ns-private"
@@ -13,13 +15,16 @@ PRI_SUBNET="10.10.2.0/24"
 PUB_IP="10.10.1.2/24"
 PRI_IP="10.10.2.2/24"
 BRIDGE_PUB_IP="10.10.1.1/24"
-HOST_IF="enX0"   # Replace with your actual host interface
+HOST_IF="enX0"    # Replace with your actual host interface
 DNS="8.8.8.8"
 FIREWALL_JSON="./firewall.json"
 
+# -----------------------------
+# Apply firewall rules per namespace
+# -----------------------------
 apply_firewall() {
     local ns=$1
-    echo "Applying firewall rules for $ns"
+    echo "[*] Applying firewall rules for $ns"
 
     # Flush previous rules
     ip netns exec $ns iptables -F
@@ -33,22 +38,15 @@ apply_firewall() {
         port=$(echo $rule | jq '.port')
         proto=$(echo $rule | jq -r '.protocol')
         action=$(echo $rule | jq -r '.action')
-        if [ "$proto" = "all" ]; then
-            proto=""
-        else
-            proto="-p $proto"
-        fi
-        if [ "$port" -ne 0 ]; then
-            port="-m $proto --dport $port"
-        else
-            port=""
-        fi
-        if [ "$action" = "allow" ]; then
-            action="-j ACCEPT"
-        else
-            action="-j DROP"
-        fi
-        ip netns exec $ns iptables -A INPUT $proto $port $action
+
+        proto_flag=""
+        port_flag=""
+        [[ "$proto" != "all" ]] && proto_flag="-p $proto"
+        [[ "$port" -ne 0 ]] && port_flag="--dport $port"
+
+        [[ "$action" == "allow" ]] && act_flag="-j ACCEPT" || act_flag="-j DROP"
+
+        ip netns exec $ns iptables -A INPUT $proto_flag $port_flag $act_flag
     done
 
     # Egress rules
@@ -56,29 +54,25 @@ apply_firewall() {
         port=$(echo $rule | jq '.port')
         proto=$(echo $rule | jq -r '.protocol')
         action=$(echo $rule | jq -r '.action')
-        if [ "$proto" = "all" ]; then
-            proto=""
-        else
-            proto="-p $proto"
-        fi
-        if [ "$port" -ne 0 ]; then
-            port="-m $proto --dport $port"
-        else
-            port=""
-        fi
-        if [ "$action" = "allow" ]; then
-            action="-j ACCEPT"
-        else
-            action="-j DROP"
-        fi
-        ip netns exec $ns iptables -A OUTPUT $proto $port $action
+
+        proto_flag=""
+        port_flag=""
+        [[ "$proto" != "all" ]] && proto_flag="-p $proto"
+        [[ "$port" -ne 0 ]] && port_flag="--dport $port"
+
+        [[ "$action" == "allow" ]] && act_flag="-j ACCEPT" || act_flag="-j DROP"
+
+        ip netns exec $ns iptables -A OUTPUT $proto_flag $port_flag $act_flag
     done
 }
 
+# -----------------------------
+# Create VPC
+# -----------------------------
 create() {
-    echo "=== Creating mini-VPC with firewall ==="
+    echo "=== Creating mini-VPC ==="
 
-    # 1. Create bridge
+    # 1. Create bridge and assign IP
     ip link add name $VPC_BRIDGE type bridge || true
     ip addr add $BRIDGE_PUB_IP dev $VPC_BRIDGE || true
     ip link set $VPC_BRIDGE up
@@ -101,40 +95,43 @@ create() {
     ip link set veth-public netns $PUBLIC_NS
     ip link set veth-private netns $PRIVATE_NS
 
-    # 4. Assign IP addresses
+    # 4. Assign IP addresses inside namespaces
     ip netns exec $PUBLIC_NS ip addr add $PUB_IP dev veth-public
     ip netns exec $PRIVATE_NS ip addr add $PRI_IP dev veth-private
 
-    # Bring interfaces up
+    # 5. Bring up interfaces
     ip netns exec $PUBLIC_NS ip link set veth-public up
     ip netns exec $PRIVATE_NS ip link set veth-private up
     ip netns exec $PUBLIC_NS ip link set lo up
     ip netns exec $PRIVATE_NS ip link set lo up
 
-    # 5. Set default routes
+    # 6. Set default routes (after bridge and IP are up)
     ip netns exec $PUBLIC_NS ip route add default via 10.10.1.1
     ip netns exec $PRIVATE_NS ip route add default via 10.10.1.1
 
-    # 6. Enable NAT for public subnet
+    # 7. Enable NAT for public subnet
     sysctl -w net.ipv4.ip_forward=1
     iptables -t nat -A POSTROUTING -s $PUB_SUBNET -o $HOST_IF -j MASQUERADE
     iptables -P FORWARD ACCEPT
 
-    # 7. Configure DNS for public namespace
+    # 8. Configure DNS for public namespace
     mkdir -p /etc/netns/$PUBLIC_NS
     echo "nameserver $DNS" > /etc/netns/$PUBLIC_NS/resolv.conf
 
-    # 8. Apply firewall rules
+    # 9. Apply firewall rules
     apply_firewall $PUBLIC_NS
     apply_firewall $PRIVATE_NS
 
-    echo "Mini-VPC created with firewall!"
+    echo "=== Mini-VPC created! ==="
 }
 
+# -----------------------------
+# Delete VPC
+# -----------------------------
 delete() {
     echo "=== Deleting mini-VPC ==="
 
-    # Flush NAT rules
+    # Flush NAT rule
     iptables -t nat -D POSTROUTING -s $PUB_SUBNET -o $HOST_IF -j MASQUERADE 2>/dev/null || true
 
     # Delete namespaces
@@ -149,9 +146,12 @@ delete() {
     ip link set $VPC_BRIDGE down 2>/dev/null || true
     ip link del $VPC_BRIDGE type bridge 2>/dev/null || true
 
-    echo "Mini-VPC deleted!"
+    echo "=== Mini-VPC deleted ==="
 }
 
+# -----------------------------
+# Main
+# -----------------------------
 case "$1" in
     create)
         create
