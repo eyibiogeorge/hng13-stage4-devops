@@ -1,5 +1,5 @@
 #!/bin/bash
-# vpcctl.sh - Mini VPC with firewall
+# vpcctl.sh - Mini VPC with firewall and auto-cleanup
 # Usage: sudo ./vpcctl.sh create|delete
 
 set -e
@@ -72,6 +72,16 @@ apply_firewall() {
 create() {
     echo "=== Creating mini-VPC ==="
 
+    # --- AUTO CLEANUP FIRST ---
+    echo "[*] Cleaning any leftover resources..."
+    ip netns del $PUBLIC_NS 2>/dev/null || true
+    ip netns del $PRIVATE_NS 2>/dev/null || true
+    ip link del veth-public 2>/dev/null || true
+    ip link del veth-private 2>/dev/null || true
+    ip link set $VPC_BRIDGE down 2>/dev/null || true
+    ip link del $VPC_BRIDGE type bridge 2>/dev/null || true
+    ip addr flush dev $VPC_BRIDGE 2>/dev/null || true
+
     # 1. Create bridge and assign IP
     ip link add name $VPC_BRIDGE type bridge || true
     ip addr add $BRIDGE_PUB_IP dev $VPC_BRIDGE || true
@@ -106,8 +116,8 @@ create() {
     ip netns exec $PRIVATE_NS ip link set lo up
 
     # 6. Set default routes (after bridge and IP are up)
-    ip netns exec $PUBLIC_NS ip route add default via 10.10.1.1
-    ip netns exec $PRIVATE_NS ip route add default via 10.10.1.1
+    ip netns exec $PUBLIC_NS ip route add default via 10.10.1.1 || true
+    ip netns exec $PRIVATE_NS ip route add default via 10.10.1.1 || true
 
     # 7. Enable NAT for public subnet
     sysctl -w net.ipv4.ip_forward=1
