@@ -1,176 +1,138 @@
 #!/bin/bash
-# vpcctl.sh - Mini VPC with firewall and auto-cleanup
-# Usage: sudo ./vpcctl.sh create|delete
+# vpcctl.sh - Mini VPC CLI for Linux
 
 set -e
 
-# -----------------------------
-# Configurable variables
-# -----------------------------
-VPC_BRIDGE="br0"
+VPC_NAME="mini-vpc"
+BRIDGE="br0"
 PUBLIC_NS="ns-public"
 PRIVATE_NS="ns-private"
-PUB_SUBNET="10.10.1.0/24"
-PRI_SUBNET="10.10.2.0/24"
-PUB_IP="10.10.1.2/24"
-PRI_IP="10.10.2.2/24"
-BRIDGE_PUB_IP="10.10.1.1/24"
-HOST_IF="enX0"    # Replace with your actual host interface
-DNS="8.8.8.8"
-FIREWALL_JSON="./firewall.json"
+PUBLIC_SUBNET="10.10.1.0/24"
+PRIVATE_SUBNET="10.10.2.0/24"
+PUBLIC_GW="10.10.1.1"
+PRIVATE_GW="10.10.2.1"
+INT_IF="enX0"  # Replace with your host interface
 
-# -----------------------------
-# Apply firewall rules per namespace
-# -----------------------------
-apply_firewall() {
-    local ns=$1
-    echo "[*] Applying firewall rules for $ns"
+# Firewall rules (example JSON-like structure)
+declare -A FW_PUBLIC=( ["allow"]="tcp:80 tcp:443" ["deny"]="tcp:22" )
+declare -A FW_PRIVATE=( ["allow"]="" ["deny"]="tcp:80 tcp:443 tcp:22" )
 
-    # Flush previous rules
-    ip netns exec $ns iptables -F
-    ip netns exec $ns iptables -X
-    ip netns exec $ns iptables -P INPUT ACCEPT
-    ip netns exec $ns iptables -P OUTPUT ACCEPT
-    ip netns exec $ns iptables -P FORWARD ACCEPT
-
-    # Ingress rules
-    jq -c ".subnets[\"$ns\"].ingress[]" $FIREWALL_JSON | while read rule; do
-        port=$(echo $rule | jq '.port')
-        proto=$(echo $rule | jq -r '.protocol')
-        action=$(echo $rule | jq -r '.action')
-
-        proto_flag=""
-        port_flag=""
-        [[ "$proto" != "all" ]] && proto_flag="-p $proto"
-        [[ "$port" -ne 0 ]] && port_flag="--dport $port"
-
-        [[ "$action" == "allow" ]] && act_flag="-j ACCEPT" || act_flag="-j DROP"
-
-        ip netns exec $ns iptables -A INPUT $proto_flag $port_flag $act_flag
-    done
-
-    # Egress rules
-    jq -c ".subnets[\"$ns\"].egress[]" $FIREWALL_JSON | while read rule; do
-        port=$(echo $rule | jq '.port')
-        proto=$(echo $rule | jq -r '.protocol')
-        action=$(echo $rule | jq -r '.action')
-
-        proto_flag=""
-        port_flag=""
-        [[ "$proto" != "all" ]] && proto_flag="-p $proto"
-        [[ "$port" -ne 0 ]] && port_flag="--dport $port"
-
-        [[ "$action" == "allow" ]] && act_flag="-j ACCEPT" || act_flag="-j DROP"
-
-        ip netns exec $ns iptables -A OUTPUT $proto_flag $port_flag $act_flag
-    done
-}
-
-# -----------------------------
-# Create VPC
-# -----------------------------
-create() {
-    echo "=== Creating mini-VPC ==="
-
-    # --- AUTO CLEANUP FIRST ---
-    echo "[*] Cleaning any leftover resources..."
+# Auto-cleanup
+cleanup() {
+    echo "[*] Cleaning leftover resources..."
     ip netns del $PUBLIC_NS 2>/dev/null || true
     ip netns del $PRIVATE_NS 2>/dev/null || true
-    ip link del veth-public 2>/dev/null || true
-    ip link del veth-private 2>/dev/null || true
-    ip link set $VPC_BRIDGE down 2>/dev/null || true
-    ip link del $VPC_BRIDGE type bridge 2>/dev/null || true
-    ip addr flush dev $VPC_BRIDGE 2>/dev/null || true
+    ip link del veth-br-public 2>/dev/null || true
+    ip link del veth-br-private 2>/dev/null || true
+    ip link del $BRIDGE 2>/dev/null || true
+    iptables -t nat -F
+    echo "[*] Cleanup complete."
+}
 
-    # 1. Create bridge and assign IP
-    ip link add name $VPC_BRIDGE type bridge || true
-    ip addr add $BRIDGE_PUB_IP dev $VPC_BRIDGE || true
-    ip link set $VPC_BRIDGE up
+create_vpc() {
+    echo "=== Creating mini-VPC ==="
+    cleanup
 
-    # 2. Create namespaces
+    # Enable IP forwarding
+    echo "[*] Enabling IP forwarding..."
+    sysctl -w net.ipv4.ip_forward=1
+
+    # Create bridge
+    echo "[*] Creating bridge $BRIDGE..."
+    ip link add name $BRIDGE type bridge || true
+    ip addr add $PUBLIC_GW/24 dev $BRIDGE || true
+    ip addr add $PRIVATE_GW/24 dev $BRIDGE || true
+    ip link set $BRIDGE up
+
+    # Create namespaces
+    echo "[*] Creating namespaces..."
     ip netns add $PUBLIC_NS || true
     ip netns add $PRIVATE_NS || true
 
-    # 3. Create veth pairs
-    ip link add veth-public type veth peer name veth-public-br
-    ip link add veth-private type veth peer name veth-private-br
+    # Create veth pairs
+    ip link add veth-public type veth peer name veth-br-public
+    ip link add veth-private type veth peer name veth-br-private
 
-    # Attach bridge ends
-    ip link set veth-public-br master $VPC_BRIDGE
-    ip link set veth-private-br master $VPC_BRIDGE
-    ip link set veth-public-br up
-    ip link set veth-private-br up
-
-    # Move namespace ends
+    # Attach veths to namespaces
     ip link set veth-public netns $PUBLIC_NS
     ip link set veth-private netns $PRIVATE_NS
 
-    # 4. Assign IP addresses inside namespaces
-    ip netns exec $PUBLIC_NS ip addr add $PUB_IP dev veth-public
-    ip netns exec $PRIVATE_NS ip addr add $PRI_IP dev veth-private
+    # Attach veths to bridge
+    ip link set veth-br-public master $BRIDGE
+    ip link set veth-br-private master $BRIDGE
+    ip link set veth-br-public up
+    ip link set veth-br-private up
 
-    # 5. Bring up interfaces
+    # Configure namespace interfaces
+    echo "[*] Configuring $PUBLIC_NS..."
+    ip netns exec $PUBLIC_NS ip addr add 10.10.1.2/24 dev veth-public
     ip netns exec $PUBLIC_NS ip link set veth-public up
-    ip netns exec $PRIVATE_NS ip link set veth-private up
     ip netns exec $PUBLIC_NS ip link set lo up
+    ip netns exec $PUBLIC_NS ip route add default via $PUBLIC_GW
+
+    echo "[*] Configuring $PRIVATE_NS..."
+    ip netns exec $PRIVATE_NS ip addr add 10.10.2.2/24 dev veth-private
+    ip netns exec $PRIVATE_NS ip link set veth-private up
     ip netns exec $PRIVATE_NS ip link set lo up
+    ip netns exec $PRIVATE_NS ip route add default via $PRIVATE_GW
 
-    # 6. Set default routes (after bridge and IP are up)
-    ip netns exec $PUBLIC_NS ip route add default via 10.10.1.1 || true
-    ip netns exec $PRIVATE_NS ip route add default via 10.10.1.1 || true
+    # Setup NAT for public subnet
+    echo "[*] Setting up NAT for public subnet..."
+    iptables -t nat -A POSTROUTING -s $PUBLIC_SUBNET -o $INT_IF -j MASQUERADE
 
-    # 7. Enable NAT for public subnet
-    sysctl -w net.ipv4.ip_forward=1
-    iptables -t nat -A POSTROUTING -s $PUB_SUBNET -o $HOST_IF -j MASQUERADE
-    iptables -P FORWARD ACCEPT
+    # Optional: firewall rules
+    echo "[*] Applying firewall rules for $PUBLIC_NS..."
+    for rule in ${FW_PUBLIC["allow"]}; do
+        proto=${rule%:*}
+        port=${rule#*:}
+        ip netns exec $PUBLIC_NS iptables -A INPUT -p $proto --dport $port -j ACCEPT
+    done
+    for rule in ${FW_PUBLIC["deny"]}; do
+        proto=${rule%:*}
+        port=${rule#*:}
+        ip netns exec $PUBLIC_NS iptables -A INPUT -p $proto --dport $port -j DROP
+    done
 
-    # 8. Configure DNS for public namespace
-    mkdir -p /etc/netns/$PUBLIC_NS
-    echo "nameserver $DNS" > /etc/netns/$PUBLIC_NS/resolv.conf
-
-    # 9. Apply firewall rules
-    apply_firewall $PUBLIC_NS
-    apply_firewall $PRIVATE_NS
+    echo "[*] Applying firewall rules for $PRIVATE_NS..."
+    for rule in ${FW_PRIVATE["allow"]}; do
+        proto=${rule%:*}
+        port=${rule#*:}
+        ip netns exec $PRIVATE_NS iptables -A INPUT -p $proto --dport $port -j ACCEPT
+    done
+    for rule in ${FW_PRIVATE["deny"]}; do
+        proto=${rule%:*}
+        port=${rule#*:}
+        ip netns exec $PRIVATE_NS iptables -A INPUT -p $proto --dport $port -j DROP
+    done
 
     echo "=== Mini-VPC created! ==="
 }
 
-# -----------------------------
-# Delete VPC
-# -----------------------------
-delete() {
+delete_vpc() {
     echo "=== Deleting mini-VPC ==="
-
-    # Flush NAT rule
-    iptables -t nat -D POSTROUTING -s $PUB_SUBNET -o $HOST_IF -j MASQUERADE 2>/dev/null || true
-
-    # Delete namespaces
-    ip netns del $PUBLIC_NS 2>/dev/null || true
-    ip netns del $PRIVATE_NS 2>/dev/null || true
-
-    # Delete veth pairs
-    ip link del veth-public 2>/dev/null || true
-    ip link del veth-private 2>/dev/null || true
-
-    # Delete bridge
-    ip link set $VPC_BRIDGE down 2>/dev/null || true
-    ip link del $VPC_BRIDGE type bridge 2>/dev/null || true
-
-    echo "=== Mini-VPC deleted ==="
+    cleanup
+    echo "=== Mini-VPC deleted! ==="
 }
 
-# -----------------------------
-# Main
-# -----------------------------
+status_vpc() {
+    echo "=== Mini-VPC Status ==="
+    ip netns list
+    ip link show $BRIDGE || echo "$BRIDGE does not exist"
+}
+
 case "$1" in
     create)
-        create
+        create_vpc
         ;;
     delete)
-        delete
+        delete_vpc
+        ;;
+    status)
+        status_vpc
         ;;
     *)
-        echo "Usage: sudo $0 create|delete"
+        echo "Usage: $0 {create|delete|status}"
         exit 1
         ;;
 esac
+
